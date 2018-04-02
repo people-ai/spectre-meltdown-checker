@@ -1308,7 +1308,7 @@ read_msr()
 		if [ ! -r /dev/cpu/"$2"/msr ]; then
 			return 200 # permission error
 		fi
-		if ! dd if=/dev/cpu/"$2"/msr bs=8 count=1 skip="$_msrindex" iflag=skip_bytes 2>/dev/null; then
+		if ! dd if=/dev/cpu/"$2"/msr bs=8 count=1 skip="$_msrindex" iflag=skip_bytes >/dev/null 2>&1; then
 			return 1
 		fi
 		read_msr_value=$(dd if=/dev/cpu/"$2"/msr bs=8 count=1 skip="$_msrindex" iflag=skip_bytes 2>/dev/null | od -t u1 -A n)
@@ -1788,11 +1788,18 @@ check_variant2_linux()
 		sys_interface_available=1
 	fi
 	if [ "$opt_sysfs_only" != 1 ]; then
-		_info     "* Mitigation 1"
-		_info_nol "  * Kernel is compiled with IBRS/IBPB support: "
+		_info "* Mitigation 1"
+
 		ibrs_can_tell=0
+		ibrs_supported=''
+		ibrs_enabled=''
+		ibpb_can_tell=0
+		ibpb_supported=''
+		ibpb_enabled=''
 
 		if [ "$opt_live" = 1 ]; then
+			# in live mode, we can check for the ibrs_enabled file in debugfs
+			# all versions of the patches have it (NOT the case of IBPB or KPTI)
 			ibrs_can_tell=1
 			mount_debugfs
 			for dir in \
@@ -1804,17 +1811,19 @@ check_variant2_linux()
 					# /sys/kernel/debug/ibrs_enabled: vanilla
 					# /sys/kernel/debug/x86/ibrs_enabled: Red Hat (see https://access.redhat.com/articles/3311301)
 					# /proc/sys/kernel/ibrs_enabled: OpenSUSE tumbleweed
-					pstatus green YES
 					ibrs_knob_dir=$dir
-					ibrs_supported=1
+					ibrs_supported="$dir/ibrs_enabled exists"
 					ibrs_enabled=$(cat "$dir/ibrs_enabled" 2>/dev/null)
 					_debug "ibrs: found $dir/ibrs_enabled=$ibrs_enabled"
+					# if ibrs_enabled is there, ibpb_enabled will be in the same dir
 					if [ -e "$dir/ibpb_enabled" ]; then
+						# if the file is there, we have IBPB compiled-in (see note above for IBRS)
+						ibpb_knob_dir=$dir
+						ibpb_supported="$dir/ibpb_enabled exists"
 						ibpb_enabled=$(cat "$dir/ibpb_enabled" 2>/dev/null)
 						_debug "ibpb: found $dir/ibpb_enabled=$ibpb_enabled"
 					else
-						ibpb_enabled=-1
-						_debug "ibpb: no ibpb_enabled file in $dir"
+						_debug "ibpb: $dir/ibpb_enabled file doesn't exist"
 					fi
 					break
 				else
@@ -1825,42 +1834,93 @@ check_variant2_linux()
 			# is set when ibrs has been administratively enabled (usually from cmdline)
 			# which in that case means ibrs is supported *and* enabled for kernel & user
 			# as per the ibrs patch series v3
-			if [ "$ibrs_supported" = 0 ]; then
+			if [ -z "$ibrs_supported" ]; then
 				if grep ^flags "$procfs/cpuinfo" | grep -qw spec_ctrl_ibrs; then
 					_debug "ibrs: found spec_ctrl_ibrs flag in $procfs/cpuinfo"
-					ibrs_supported=1
+					ibrs_supported="spec_ctrl_ibrs flag in $procfs/cpuinfo"
 					# enabled=2 -> kernel & user
 					ibrs_enabled=2
 					# XXX and what about ibpb ?
 				fi
 			fi
+			if [ -e "/sys/devices/system/cpu/vulnerabilities/spectre_v2" ]; then
+				# when IBPB is enabled on 4.15+, we can see it in sysfs
+				if grep -q ', IBPB' "/sys/devices/system/cpu/vulnerabilities/spectre_v2"; then
+					_debug "ibpb: found enabled in sysfs"
+					ibpb_supported='IBPB found enabled in sysfs'
+					ibpb_enabled=1
+				fi
+				# when IBRS_FW is enabled on 4.15+, we can see it in sysfs
+				if grep -q ', IBRS_FW' "/sys/devices/system/cpu/vulnerabilities/spectre_v2"; then
+					_debug "ibrs: found IBRS_FW in sysfs"
+					ibrs_supported='found IBRS_FW in sysfs'
+					ibrs_fw_enabled=1
+				fi
+				# when IBRS is enabled on 4.15+, we can see it in sysfs
+				if grep -q 'Indirect Branch Restricted Speculation' "/sys/devices/system/cpu/vulnerabilities/spectre_v2"; then
+					_debug "ibrs: found IBRS in sysfs"
+					ibrs_supported='found IBRS in sysfs'
+					ibrs_enabled=3
+				fi
+			fi
+			# in live mode, if ibrs or ibpb is supported and we didn't find these are enabled, then they are not
+			[ -n "$ibrs_supported" ] && [ -z "$ibrs_enabled" ] && ibrs_enabled=0
+			[ -n "$ibpb_supported" ] && [ -z "$ibpb_enabled" ] && ibpb_enabled=0
 		fi
-		if [ "$ibrs_supported" != 1 ] && [ -n "$opt_map" ]; then
+		if [ -z "$ibrs_supported" ]; then
+			check_redhat_canonical_spectre
+			if [ "$redhat_canonical_spectre" = 1 ]; then
+				ibrs_supported="Red Hat/Ubuntu variant"
+				ibpb_supported="Red Hat/Ubuntu variant"
+			fi
+		fi
+		if [ -z "$ibrs_supported" ] && [ -n "$kernel" ]; then
+			if ! which "${opt_arch_prefix}strings" >/dev/null 2>&1; then
+				:
+			else
+				ibrs_can_tell=1
+				ibrs_supported=$("${opt_arch_prefix}strings" "$kernel" | grep -Fw -e ', IBRS_FW' | head -1)
+				if [ -n "$ibrs_supported" ]; then
+					_debug "ibrs: found ibrs evidence in kernel image ($ibrs_supported)"
+					ibrs_supported="found '$ibrs_supported' in kernel image"
+				fi
+			fi
+		fi
+		if [ -z "$ibrs_supported" ] && [ -n "$opt_map" ]; then
 			ibrs_can_tell=1
 			if grep -q spec_ctrl "$opt_map"; then
-				pstatus green YES
-				ibrs_supported=1
+				ibrs_supported="found spec_ctrl in symbols file"
 				_debug "ibrs: found '*spec_ctrl*' symbol in $opt_map"
 			fi
 		fi
-		if [ "$ibrs_supported" != 1 ]; then
-			check_redhat_canonical_spectre
-			if [ "$redhat_canonical_spectre" = 1 ]; then
-				pstatus green YES "Red Hat/Ubuntu patch"
-				ibrs_supported=1
+		# recent (4.15) vanilla kernels have IBPB but not IBRS, and without the debugfs tunables of Red Hat
+		# we can detect it directly in the image
+		if [ -z "$ibpb_supported" ] && [ -n "$kernel" ]; then
+			if ! which "${opt_arch_prefix}strings" >/dev/null 2>&1; then
+				:
+			else
+				ibpb_can_tell=1
+				ibpb_supported=$("${opt_arch_prefix}strings" "$kernel" | grep -Fw -e 'ibpb' -e ', IBPB' | head -1)
+				if [ -n "$ibpb_supported" ]; then
+					_debug "ibpb: found ibpb evidence in kernel image ($ibpb_supported)"
+					ibpb_supported="found '$ibpb_supported' in kernel image"
+				fi
 			fi
 		fi
-		if [ "$ibrs_supported" != 1 ]; then
+
+		_info_nol "  * Kernel is compiled with IBRS support: "
+		if [ -z "$ibrs_supported" ]; then
 			if [ "$ibrs_can_tell" = 1 ]; then
 				pstatus yellow NO
 			else
 				# if we're in offline mode without System.map, we can't really know
-				pstatus yellow UNKNOWN "in offline mode, we need System.map to be able to tell"
+				pstatus yellow UNKNOWN "in offline mode, we need the kernel image and System.map to be able to tell"
 			fi
+		else
+			pstatus green YES "$ibrs_supported"
 		fi
 
-		_info     "  * Currently enabled features"
-		_info_nol "    * IBRS enabled for Kernel space: "
+		_info_nol "    * IBRS enabled and active: "
 		if [ "$opt_live" = 1 ]; then
 			if [ "$ibpb_enabled" = 2 ]; then
 				# if ibpb=2, ibrs is forcefully=0
@@ -1869,6 +1929,7 @@ check_variant2_linux()
 				# 0 means disabled
 				# 1 is enabled only for kernel space
 				# 2 is enabled for kernel and user space
+				# 3 is enabled
 				case "$ibrs_enabled" in
 					"")
 						if [ "$ibrs_supported" = 1 ]; then
@@ -1881,41 +1942,29 @@ check_variant2_linux()
 						pstatus yellow NO
 						_verbose "    - To enable, \`echo 1 > $ibrs_knob_dir/ibrs_enabled' as root. If you don't have hardware support, you'll get an error."
 						;;
-					1 | 2) pstatus green YES;;
-					*)     pstatus yellow UNKNOWN;;
+					1)	pstatus green YES "for kernel space";;
+					2)	pstatus green YES "for both kernel and user space";;
+					3)	if [ "$ibrs_fw_enabled" = 1 ]; then pstatus green YES "in kernel and firmware code"; else pstatus green YES; fi;;
+					*)	pstatus yellow UNKNOWN;;
 				esac
 			fi
 		else
 			pstatus blue N/A "not testable in offline mode"
 		fi
 
-		_info_nol "    * IBRS enabled for User space: "
-		if [ "$opt_live" = 1 ]; then
-			if [ "$ibpb_enabled" = 2 ]; then
-				# if ibpb=2, ibrs is forcefully=0
-				pstatus blue NO "IBPB used instead of IBRS in all kernel entrypoints"
+		_info_nol "  * Kernel is compiled with IBPB support: "
+		if [ -z "$ibpb_supported" ]; then
+			if [ "$ibpb_can_tell" = 1 ]; then
+				pstatus yellow NO
 			else
-				case "$ibrs_enabled" in
-					"")
-						if [ "$ibrs_supported" = 1 ]; then
-							pstatus yellow UNKNOWN
-						else
-							pstatus yellow NO
-						fi
-						;;
-					0 | 1)
-						pstatus yellow NO
-						_verbose "    - To enable, \`echo 2 > $ibrs_knob_dir/ibrs_enabled' as root. If you don't have hardware support, you'll get an error."
-						;;
-					2) pstatus green YES;;
-					*) pstatus yellow UNKNOWN;;
-				esac
+				# if we're in offline mode without System.map, we can't really know
+				pstatus yellow UNKNOWN "in offline mode, we need the kernel image to be able to tell"
 			fi
 		else
-			pstatus blue N/A "not testable in offline mode"
+			pstatus green YES "$ibpb_supported"
 		fi
 
-		_info_nol "    * IBPB enabled: "
+		_info_nol "    * IBPB enabled and active: "
 		if [ "$opt_live" = 1 ]; then
 			case "$ibpb_enabled" in
 				"")
@@ -1927,7 +1976,7 @@ check_variant2_linux()
 					;;
 				0)
 					pstatus yellow NO
-					_verbose "    - To enable, \`echo 1 > $ibrs_knob_dir/ibpb_enabled' as root. If you don't have hardware support, you'll get an error."
+					_verbose "    - To enable, \`echo 1 > $ibpb_knob_dir/ibpb_enabled' as root. If you don't have hardware support, you'll get an error."
 					;;
 				1) pstatus green YES;;
 				2) pstatus green YES "IBPB used instead of IBRS in all kernel entrypoints";;
@@ -1936,6 +1985,7 @@ check_variant2_linux()
 		else
 			pstatus blue N/A "not testable in offline mode"
 		fi
+
 
 		_info "* Mitigation 2"
 		_info_nol "  * Kernel has branch predictor hardening (ARM): "
@@ -2072,8 +2122,10 @@ check_variant2_linux()
 				pvulnstatus $cve VULN "IBRS hardware + kernel support OR kernel with retpoline are needed to mitigate the vulnerability"
 			fi
 		else
-			if [ "$ibrs_supported" = 1 ]; then
+			if [ -n "$ibrs_supported" ]; then
 				pvulnstatus $cve OK "offline mode: IBRS/IBPB will mitigate the vulnerability if enabled at runtime"
+			elif [ "$retpoline" = 1 ]; then
+				pvulnstatus $cve OK "retpoline mitigates the vulnerability"
 			elif [ "$ibrs_can_tell" = 1 ]; then
 				pvulnstatus $cve VULN "IBRS hardware + kernel support OR kernel with retpoline are needed to mitigate the vulnerability"
 			else
@@ -2208,7 +2260,7 @@ check_variant3_linux()
 		fi
 
 		mount_debugfs
-		_info_nol "* PTI enabled and active: "
+		_info_nol "  * PTI enabled and active: "
 		if [ "$opt_live" = 1 ]; then
 			dmesg_grep="Kernel/User page tables isolation: enabled"
 			dmesg_grep="$dmesg_grep|Kernel page table isolation enabled"
@@ -2248,7 +2300,7 @@ check_variant3_linux()
 				pstatus yellow NO
 			fi
 		else
-			pstatus blue N/A "can't verify if PTI is enabled in offline mode"
+			pstatus blue N/A "not testable in offline mode"
 		fi
 
 		# no security impact but give a hint to the user in verbose mode
@@ -2368,7 +2420,7 @@ check_variant3_bsd()
 		pstatus green YES
 	fi
 
-	_info_nol "* PTI enabled and active: "
+	_info_nol "  * PTI enabled and active: "
 	if [ "$kpti_enabled" = 1 ]; then
 		pstatus green YES
 	else
@@ -2405,6 +2457,8 @@ if [ "$opt_variant3" = 1 ] || [ "$opt_allvariants" = 1 ]; then
 	check_variant3
 	_info
 fi
+
+#_debug "variables at end of script: $(printenv | grep -Ev '^[A_Z_]' | sort | tr \"\n\" ';')"
 
 _info "A false sense of security is worse than no security at all, see --disclaimer"
 
